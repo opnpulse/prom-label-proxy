@@ -17,7 +17,6 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -44,10 +43,13 @@ const (
 )
 
 type routes struct {
-	upstream *url.URL
-	handler  http.Handler
-	label    string
-	el       ExtractLabeler
+	upstream              *url.URL
+	handler               http.Handler
+	logsHandler           http.Handler
+	tracesHandler         http.Handler
+	thanosReceiverHandler http.Handler
+	label                 string
+	el                    ExtractLabeler
 
 	mux                   http.Handler
 	modifiers             map[string]func(*http.Response) error
@@ -360,9 +362,45 @@ func NewRoutes(upstream *url.URL, label string, extractLabeler ExtractLabeler, o
 
 	proxy := httputil.NewSingleHostReverseProxy(upstream)
 
+	logsUrlFromEnv := os.Getenv("LOGS_URL")
+	logsURL, err := url.Parse(logsUrlFromEnv)
+	if err != nil {
+		log.Fatalf("Failed to build parse logs URL: %v", err)
+	}
+
+	if logsURL.Scheme != "http" && logsURL.Scheme != "https" {
+		log.Fatalf("Invalid scheme for logs URL %q, only 'http' and 'https' are supported", upstream)
+	}
+	logsHandler := httputil.NewSingleHostReverseProxy(logsURL)
+
+	tracesUrlFromEnv := os.Getenv("TRACES_URL")
+	tracesURL, err := url.Parse(tracesUrlFromEnv)
+	if err != nil {
+		log.Fatalf("Failed to build parse traces URL: %v", err)
+	}
+
+	if tracesURL.Scheme != "http" && tracesURL.Scheme != "https" {
+		log.Fatalf("Invalid scheme for traces URL %q, only 'http' and 'https' are supported", upstream)
+	}
+	tracesHandler := httputil.NewSingleHostReverseProxy(tracesURL)
+
+	thanosReceiverUrlFromEnv := os.Getenv("METRICS_URL")
+	thanosReceiverURL, err := url.Parse(thanosReceiverUrlFromEnv)
+	if err != nil {
+		log.Fatalf("Failed to build parse traces URL: %v", err)
+	}
+
+	if thanosReceiverURL.Scheme != "http" && thanosReceiverURL.Scheme != "https" {
+		log.Fatalf("Invalid scheme for metruc URL %q, only 'http' and 'https' are supported", upstream)
+	}
+	thanosRecieverHandler := httputil.NewSingleHostReverseProxy(thanosReceiverURL)
+
 	r := &routes{
 		upstream:              upstream,
 		handler:               proxy,
+		logsHandler:           logsHandler,
+		tracesHandler:         tracesHandler,
+		thanosReceiverHandler: thanosRecieverHandler,
 		label:                 label,
 		el:                    extractLabeler,
 		errorOnReplace:        opt.errorOnReplace,
@@ -420,9 +458,41 @@ func NewRoutes(upstream *url.URL, label string, extractLabeler ExtractLabeler, o
 		mux.Handle("/api/v2/alerts", r.el.ExtractLabel(enforceMethods(r.alerts, "GET"))),
 	)
 
+	//errs.Add(
+	//	mux.Handle("/healthz", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	//		_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+	//	})),
+	//)
+
+	chHandler := func(backend http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			req.URL.Path = "/"
+			if user, pass := os.Getenv("CLICKHOUSE_USER"), os.Getenv("CLICKHOUSE_PASSWORD"); user != "" && pass != "" {
+				req.Header.Set("X-Clickhouse-User", user)
+				req.Header.Set("X-Clickhouse-Key", pass)
+			}
+			backend.ServeHTTP(w, req)
+		})
+	}
+
 	errs.Add(
-		mux.Handle("/healthz", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+		mux.Handle("/logs", chHandler(r.logsHandler)),
+		mux.Handle("/traces", chHandler(r.tracesHandler)),
+
+		mux.Handle("/api/v1/receive", http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			r.thanosReceiverHandler.ServeHTTP(w, req)
+		})),
+
+		mux.Handle("/api/v1/logs", http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			req.URL.Path = "/"
+			r.logsHandler.ServeHTTP(w, req)
+		})),
+
+		mux.Handle("/api/v1/traces", http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			req.URL.Path = "/"
+			//req.TLS = nil
+			//req.Header.Del("Authorization")
+			r.tracesHandler.ServeHTTP(w, req)
 		})),
 	)
 

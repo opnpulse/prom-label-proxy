@@ -15,6 +15,10 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
@@ -23,6 +27,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"regexp"
 	"strings"
 	"syscall"
@@ -32,7 +37,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 
+	"github.com/prometheus-community/prom-label-proxy/certauth"
 	"github.com/prometheus-community/prom-label-proxy/injectproxy"
+	"github.com/prometheus-community/prom-label-proxy/tlsconfig"
 )
 
 type arrayFlags []string
@@ -75,6 +82,12 @@ func main() {
 		promQLExperimentalFunctions     bool
 		promQLExtendedRangeSelectors    bool
 		promQLBinopFillModifiers        bool
+		// Server TLS flags
+		tlsCertFile       string
+		tlsKeyFile        string
+		tlsCAFile         string
+		requireClientCert bool
+		certAuthOU        string
 	)
 
 	flagset := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
@@ -102,6 +115,12 @@ func main() {
 	flagset.BoolVar(&promQLExperimentalFunctions, "enable-promql-experimental-functions", false, "When true, the proxy supports experimental functions in PromQL expressions.")
 	flagset.BoolVar(&promQLExtendedRangeSelectors, "enable-promql-extended-range-selectors", false, "When true, the proxy supports extended range selectors in PromQL expressions.")
 	flagset.BoolVar(&promQLBinopFillModifiers, "enable-promql-binop-fill-modifiers", false, "When true, the proxy supports binary operation fill modifiers in PromQL expressions.")
+	// Server TLS flags
+	flagset.StringVar(&tlsCertFile, "tls-cert-file", "", "Path to the server certificate for mTLS.")
+	flagset.StringVar(&tlsKeyFile, "tls-key-file", "", "Path to the server key for mTLS.")
+	flagset.StringVar(&tlsCAFile, "tls-ca-file", "", "Path to the CA certificate for verifying client certificates.")
+	flagset.BoolVar(&requireClientCert, "require-client-cert", false, "When true, requires a client certificate for all requests.")
+	flagset.StringVar(&certAuthOU, "cert-auth-ou", "", "Required OU field in client certificate for authorization (e.g. EnableTenant=True).")
 
 	//nolint: errcheck // Parse() will exit on error.
 	flagset.Parse(os.Args[1:])
@@ -214,6 +233,11 @@ func main() {
 
 	var g run.Group
 	{
+		specialTables := map[string]string{
+			"logs":   "otel_logs",
+			"traces": "otel_traces",
+		}
+
 		// Run the insecure HTTP server.
 		routes, err := injectproxy.NewRoutes(upstreamURL, label, extractLabeler, opts...)
 		if err != nil {
@@ -221,11 +245,121 @@ func main() {
 		}
 
 		mux := http.NewServeMux()
-		mux.Handle("/", routes)
 
-		l, err := net.Listen("tcp", insecureListenAddress)
-		if err != nil {
-			log.Fatalf("Failed to listen on insecure address: %v", err)
+		// Health check endpoints (don’t wrap with /prom/)
+		mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+		})
+
+		mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+		})
+
+		// Handler for push endpoints without tenant in path.
+		// It extracts the tenant ID from the client certificate's Common Name.
+		pushHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !requireClientCert {
+				http.Error(w, "Client certificate required for this endpoint", http.StatusForbidden)
+				return
+			}
+			// Identity extraction: Prefer Thanos-Tenant header, fallback to Cert CN if needed.
+			tenant := r.Header.Get("Thanos-Tenant")
+			if tenant == "" {
+				tenant = "default"
+			}
+			// If the identified tenant is not "default", verify the certificate has the required OU.
+			if tenant != "default" && certAuthOU != "" {
+				if ok := certauth.HasOU(r.TLS, certAuthOU); !ok {
+					http.Error(w, fmt.Sprintf("Certificate missing required OU for non-default tenant %s", tenant), http.StatusForbidden)
+					return
+				}
+			}
+
+			isClickHouse := r.URL.Path == "/api/v1/logs" || r.URL.Path == "/api/v1/traces"
+			if isClickHouse {
+				chUser := os.Getenv("CLICKHOUSE_USER")
+				chPass := os.Getenv("CLICKHOUSE_PASSWORD")
+				if chUser != "" && chPass != "" {
+					r.Header.Set("X-Clickhouse-User", chUser)
+					r.Header.Set("X-Clickhouse-Key", chPass)
+				}
+			}
+
+			routes.ServeHTTP(w, r)
+		})
+
+		mux.Handle("/api/v1/receive", pushHandler)
+		mux.Handle("/api/v1/logs", pushHandler)
+		mux.Handle("/api/v1/traces", pushHandler)
+
+		mux.Handle("/telemetry/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			path := strings.TrimPrefix(r.URL.Path, "/telemetry/")
+			parts := strings.SplitN(path, "/", 2)
+			if len(parts) < 2 {
+				http.Error(w, "invalid path", http.StatusBadRequest)
+				return
+			}
+
+			uidcid := parts[0]
+			resp, err := authorize(r, uidcid)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusForbidden)
+				return
+			}
+
+			rest := "/" + strings.TrimPrefix(parts[1], "/")
+			restParts := strings.SplitN(strings.TrimPrefix(rest, "/"), "/", 2)
+			secondSegment := restParts[0]
+			if table, ok := specialTables[secondSegment]; ok {
+				tenant := "default"
+				if resp.ClientOrg == "true" {
+					tenant = resp.Owner
+				}
+
+				updateQueryParams(r, getDBName(tenant, resp.ClusterName), table)
+			} else {
+				// normal Prometheus path
+				q := r.URL.Query()
+				if resp.ClientOrg == "true" {
+					q.Set("tenant_id", resp.Owner)
+				} else {
+					q.Set("tenant_id", "default")
+				}
+				r.URL.RawQuery = q.Encode()
+			}
+
+			r.URL.Path = "/" + strings.TrimPrefix(parts[1], "/")
+			routes.ServeHTTP(w, r)
+		}))
+
+		var l net.Listener
+		if tlsCertFile != "" && tlsKeyFile != "" {
+			clientAuth := tls.NoClientCert
+			if requireClientCert {
+				// Use VerifyClientCertIfGiven so that non-mTLS clients (like queries) can still connect.
+				// We will enforce the presence of a certificate manually in the handlers that need it.
+				clientAuth = tls.VerifyClientCertIfGiven
+			}
+
+			tlsConfig, err := tlsconfig.NewServerTLSConfig(tlsconfig.ServerConfig{
+				CertFile:   tlsCertFile,
+				KeyFile:    tlsKeyFile,
+				CAFile:     tlsCAFile,
+				ClientAuth: clientAuth,
+			})
+			if err != nil {
+				log.Fatalf("Failed to create server TLS config: %v", err)
+			}
+			l, err = tls.Listen("tcp", insecureListenAddress, tlsConfig)
+			if err != nil {
+				log.Fatalf("Failed to listen on address %s with TLS: %v", insecureListenAddress, err)
+			}
+		} else {
+			l, err = net.Listen("tcp", insecureListenAddress)
+			if err != nil {
+				log.Fatalf("Failed to listen on insecure address: %v", err)
+			}
+			log.Printf("Listening insecurely on %v", l.Addr())
 		}
 
 		srv := &http.Server{Handler: mux}
@@ -278,4 +412,87 @@ func main() {
 		}
 		log.Print("Caught signal; exiting gracefully...")
 	}
+}
+
+type authResp struct {
+	Owner       string `json:"owner"`
+	ClusterName string `json:"clusterName"`
+	ClientOrg   string `json:"clientOrg"`
+}
+
+func authorize(req *http.Request, uidcid string) (*authResp, error) {
+	apiUrl, ok := os.LookupEnv("PLATFORM_APISERVER_DOMAIN")
+	if !ok {
+		return nil, errors.New("PLATFORM_APISERVER_DOMAIN env variable not set")
+	}
+	apiUrl = strings.TrimSuffix(apiUrl, "/")
+
+	u, err := url.Parse(apiUrl)
+	if err != nil {
+		return nil, err
+	}
+
+	u.Path = path.Join(u.Path, "api/v1/trickster/auth", uidcid, "/api/v1/query")
+	r2, err := http.NewRequest(http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	r2.Header = req.Header
+	if csrf, err := req.Cookie("_csrf"); err == nil {
+		r2.Header.Set("X-Csrf-Token", csrf.Value)
+	}
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
+		},
+	}
+	resp, err := client.Do(r2)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status code %d", resp.StatusCode)
+	}
+
+	var data authResp
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return nil, fmt.Errorf("failed to parse auth response: %w", err)
+	}
+	return &data, nil
+}
+
+var fromRe = regexp.MustCompile(`(?i)\b(from|join)\s+([a-zA-Z0-9_\.]+)`)
+
+func updateQueryParams(r *http.Request, database, table string) {
+	q := r.URL.Query()
+	q.Set("database", database)
+
+	if query := q.Get("query"); query != "" {
+		query = fromRe.ReplaceAllString(query, fmt.Sprintf("${1} %s", table))
+		q.Set("query", query)
+	}
+
+	r.URL.RawQuery = q.Encode()
+}
+
+func getDBName(tenant, clusterName string) string {
+	rgx := regexp.MustCompile(`[^a-zA-Z0-9]`)
+	if tenant == "default" {
+		return rgx.ReplaceAllString("default_"+clusterName, "_")
+	}
+	return rgx.ReplaceAllString(tenant, "_")
+}
+
+func encodeCertPEM(cert *x509.Certificate) []byte {
+	block := pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: cert.Raw,
+	}
+	return pem.EncodeToMemory(&block)
 }
