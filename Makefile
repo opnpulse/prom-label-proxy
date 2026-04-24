@@ -13,7 +13,7 @@
 
 # Needs to be defined before including Makefile.common to auto-generate targets
 DOCKER_ARCHS ?= amd64 arm64
-DOCKER_REPO  ?= prometheuscommunity
+DOCKER_REPO  ?= ghcr.io/opnpulse
 
 include Makefile.common
 
