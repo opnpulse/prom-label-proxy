@@ -479,6 +479,12 @@ func NewRoutes(upstream *url.URL, label string, extractLabeler ExtractLabeler, o
 		mux.Handle("/logs", chHandler(r.logsHandler)),
 		mux.Handle("/traces", chHandler(r.tracesHandler)),
 
+		mux.Handle("/metrics", http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			path := strings.TrimPrefix(req.URL.Path, "/metrics")
+			req.URL.Path = path
+			proxy.ServeHTTP(w, req)
+		})),
+
 		mux.Handle("/api/v1/receive", http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 			r.thanosReceiverHandler.ServeHTTP(w, req)
 		})),
@@ -650,6 +656,7 @@ func (r *routes) passthrough(w http.ResponseWriter, req *http.Request) {
 }
 
 func (r *routes) query(w http.ResponseWriter, req *http.Request) {
+	fmt.Printf("req: %+v\n", req)
 	matcher, err := r.newLabelMatcher(MustLabelValues(req.Context())...)
 	if err != nil {
 		prometheusAPIError(w, err.Error(), http.StatusBadRequest)
