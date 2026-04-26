@@ -262,11 +262,29 @@ func main() {
 				http.Error(w, "Client certificate required for this endpoint", http.StatusForbidden)
 				return
 			}
+
+			if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
+				http.Error(w, "Client certificate required", http.StatusForbidden)
+				return
+			}
 			// Identity extraction: Prefer Thanos-Tenant header, fallback to Cert CN if needed.
 			tenant := r.Header.Get("Thanos-Tenant")
 			if tenant == "" {
 				tenant = "default"
 			}
+
+			if !isPushPath(r.URL.Path) {
+				// Query paths (e.g. /api/v1/query) require the tenant_id label
+				// param to be set. Inject "default" so the proxy's enforcement
+				// is satisfied; the header-based tenant is only used for push
+				// paths (receive / logs / traces).
+				q := r.URL.Query()
+				if q.Get("tenant_id") == "" {
+					q.Set("tenant_id", "default")
+					r.URL.RawQuery = q.Encode()
+				}
+			}
+
 			// If the identified tenant is not "default", verify the certificate has the required OU.
 			if tenant != "default" && certAuthOU != "" {
 				if ok := certauth.HasOU(r.TLS, certAuthOU); !ok {
@@ -288,6 +306,7 @@ func main() {
 			routes.ServeHTTP(w, r)
 		})
 
+		mux.Handle("/api/v1/", pushHandler)
 		mux.Handle("/api/v1/receive", pushHandler)
 		mux.Handle("/api/v1/logs", pushHandler)
 		mux.Handle("/api/v1/traces", pushHandler)
@@ -495,4 +514,8 @@ func encodeCertPEM(cert *x509.Certificate) []byte {
 		Bytes: cert.Raw,
 	}
 	return pem.EncodeToMemory(&block)
+}
+
+func isPushPath(path string) bool {
+	return strings.HasPrefix(path, "/api/v1/receive") || strings.HasPrefix(path, "/api/v1/logs") || strings.HasPrefix(path, "/api/v1/traces")
 }
