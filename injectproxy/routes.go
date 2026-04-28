@@ -479,6 +479,12 @@ func NewRoutes(upstream *url.URL, label string, extractLabeler ExtractLabeler, o
 		mux.Handle("/logs", chHandler(r.logsHandler)),
 		mux.Handle("/traces", chHandler(r.tracesHandler)),
 
+		mux.Handle("/metrics", http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			path := strings.TrimPrefix(req.URL.Path, "/metrics")
+			req.URL.Path = path
+			proxy.ServeHTTP(w, req)
+		})),
+
 		mux.Handle("/api/v1/receive", http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 			r.thanosReceiverHandler.ServeHTTP(w, req)
 		})),
