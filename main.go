@@ -22,6 +22,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -40,6 +41,8 @@ import (
 	"github.com/prometheus-community/prom-label-proxy/certauth"
 	"github.com/prometheus-community/prom-label-proxy/injectproxy"
 	"github.com/prometheus-community/prom-label-proxy/tlsconfig"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/promql/parser"
 )
 
 type arrayFlags []string
@@ -334,17 +337,11 @@ func main() {
 				if resp.ClientOrg == "true" {
 					tenant = resp.Owner
 				}
-
 				updateQueryParams(r, getDBName(tenant, resp.ClusterName), table)
 			} else {
-				// normal Prometheus path
-				q := r.URL.Query()
-				if resp.ClientOrg == "true" {
-					q.Set("tenant_id", resp.Owner)
-				} else {
-					q.Set("tenant_id", "default")
+				if !enforceNamespace(w, r, resp.Owner, resp.ClientOrg == "true") {
+					return
 				}
-				r.URL.RawQuery = q.Encode()
 			}
 
 			r.URL.Path = "/" + strings.TrimPrefix(parts[1], "/")
@@ -518,4 +515,152 @@ func encodeCertPEM(cert *x509.Certificate) []byte {
 
 func isPushPath(path string) bool {
 	return strings.HasPrefix(path, "/api/v1/receive") || strings.HasPrefix(path, "/api/v1/logs") || strings.HasPrefix(path, "/api/v1/traces")
+}
+
+var errMismatchedNamespace = errors.New("mismatched namespace")
+
+type namespaceRewriter struct {
+	owner string
+}
+
+func (r *namespaceRewriter) Visit(node parser.Node, path []parser.Node) (parser.Visitor, error) {
+	if node == nil {
+		return nil, nil
+	}
+	switch n := node.(type) {
+	case *parser.VectorSelector:
+		found := false
+		for _, m := range n.LabelMatchers {
+			if m.Name == "namespace" {
+				if m.Value != r.owner {
+					return nil, errMismatchedNamespace
+				}
+				// It matches the owner; nothing to rewrite.
+				found = true
+			}
+		}
+		if !found {
+			n.LabelMatchers = append(n.LabelMatchers, &labels.Matcher{
+				Type:  labels.MatchEqual,
+				Name:  "namespace",
+				Value: r.owner,
+			})
+		}
+	}
+	return r, nil
+}
+
+func rewriteNamespace(query, owner string) (string, error) {
+	expr, err := parser.NewParser(parser.Options{}).ParseExpr(query)
+	if err != nil {
+		return query, err
+	}
+	if err := parser.Walk(&namespaceRewriter{owner: owner}, expr, nil); err != nil {
+		return query, err
+	}
+	return expr.String(), nil
+}
+
+// enforceNamespace rewrites the namespace label in all Prometheus query params
+// of r to owner (when isClientOrg is true), or sets tenant_id to "default".
+// It handles both GET (URL query params) and POST (application/x-www-form-urlencoded body).
+// Returns false if it already wrote an HTTP error response.
+func enforceNamespace(w http.ResponseWriter, r *http.Request, owner string, isClientOrg bool) bool {
+	isFormPost := r.Method == http.MethodPost &&
+		strings.Contains(r.Header.Get("Content-Type"), "application/x-www-form-urlencoded")
+	if isFormPost {
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, "failed to parse form: "+err.Error(), http.StatusBadRequest)
+			return false
+		}
+	}
+
+	// get/set abstract over URL params vs POST body.
+	get := func(key string) string {
+		if isFormPost {
+			return r.Form.Get(key)
+		}
+		return r.URL.Query().Get(key)
+	}
+	set := func(key, val string) {
+		if isFormPost {
+			r.Form.Set(key, val)
+			return
+		}
+		q := r.URL.Query()
+		q.Set(key, val)
+		r.URL.RawQuery = q.Encode()
+	}
+	getSlice := func(key string) []string {
+		if isFormPost {
+			return r.Form[key]
+		}
+		return r.URL.Query()[key]
+	}
+	setSlice := func(key string, vals []string) {
+		if isFormPost {
+			r.Form[key] = vals
+			return
+		}
+		q := r.URL.Query()
+		q[key] = vals
+		r.URL.RawQuery = q.Encode()
+	}
+
+	if !isClientOrg {
+		set("tenant_id", "default")
+		if isFormPost {
+			encoded := r.Form.Encode()
+			r.Body = io.NopCloser(strings.NewReader(encoded))
+			r.ContentLength = int64(len(encoded))
+			r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		}
+		return true
+	}
+
+	// applyNamespace injects namespace=owner, or validates an existing one. If an existing namespace
+	// is present but does not match owner, it returns a 403 Forbidden.
+	applyNamespace := func(expr string) (string, bool) {
+		out, err := rewriteNamespace(expr, owner)
+		if err != nil {
+			if errors.Is(err, errMismatchedNamespace) {
+				http.Error(w, "namespace label does not match owner", http.StatusForbidden)
+				return "", false
+			}
+			http.Error(w, "invalid query: "+err.Error(), http.StatusBadRequest)
+			return "", false
+		}
+		return out, true
+	}
+
+	if query := get("query"); query != "" {
+		out, ok := applyNamespace(query)
+		if !ok {
+			return false
+		}
+		set("query", out)
+	}
+
+	// Rewrite "match[]" params (label APIs).
+	matchers := getSlice("match[]")
+	for i, m := range matchers {
+		out, ok := applyNamespace(m)
+		if !ok {
+			return false
+		}
+		matchers[i] = out
+	}
+	if len(matchers) > 0 {
+		setSlice("match[]", matchers)
+	}
+	set("tenant_id", owner)
+
+	// Rebuild POST body after modifications.
+	if isFormPost {
+		encoded := r.Form.Encode()
+		r.Body = io.NopCloser(strings.NewReader(encoded))
+		r.ContentLength = int64(len(encoded))
+		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	}
+	return true
 }
