@@ -32,6 +32,7 @@ import (
 	"regexp"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/metalmatze/signal/internalserver"
 	"github.com/oklog/run"
@@ -40,6 +41,7 @@ import (
 
 	"github.com/prometheus-community/prom-label-proxy/certauth"
 	"github.com/prometheus-community/prom-label-proxy/injectproxy"
+	"github.com/prometheus-community/prom-label-proxy/revocation"
 	"github.com/prometheus-community/prom-label-proxy/tlsconfig"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql/parser"
@@ -91,6 +93,9 @@ func main() {
 		tlsCAFile         string
 		requireClientCert bool
 		certAuthOU        string
+		// Revocation flags
+		revocationRefreshInterval time.Duration
+		revocationStartupTimeout  time.Duration
 	)
 
 	flagset := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
@@ -124,6 +129,11 @@ func main() {
 	flagset.StringVar(&tlsCAFile, "tls-ca-file", "", "Path to the CA certificate for verifying client certificates.")
 	flagset.BoolVar(&requireClientCert, "require-client-cert", false, "When true, requires a client certificate for all requests.")
 	flagset.StringVar(&certAuthOU, "cert-auth-ou", "", "Required OU field in client certificate for authorization (e.g. EnableTenant=True).")
+	// Revocation flags
+	flagset.DurationVar(&revocationRefreshInterval, "revocation-refresh-interval", 5*time.Minute,
+		"How often to refresh the revocation list from the platform API server.")
+	flagset.DurationVar(&revocationStartupTimeout, "revocation-startup-timeout", 30*time.Second,
+		"Maximum time to wait for the initial revocation list fetch before aborting startup.")
 
 	//nolint: errcheck // Parse() will exit on error.
 	flagset.Parse(os.Args[1:])
@@ -234,7 +244,39 @@ func main() {
 		extractLabeler = injectproxy.HTTPHeaderEnforcer{Name: http.CanonicalHeaderKey(headerName), ParseListSyntax: headerUsesListSyntax}
 	}
 
+	// Revocation cache: blocking initial fetch then background refresh.
+	revocationCache := revocation.NewCache()
+	revocationFetcher, err := revocation.NewFetcher()
+	if err != nil {
+		log.Fatalf("Failed to create revocation fetcher: %v", err)
+	}
+	{
+		startCtx, startCancel := context.WithTimeout(context.Background(), revocationStartupTimeout)
+		if err := revocationCache.FetchOnce(startCtx, revocationFetcher); err != nil {
+			log.Fatalf("Failed to load initial revocation list: %v", err)
+		}
+		startCancel()
+		log.Printf("Revocation cache loaded")
+	}
+
 	var g run.Group
+	{
+		refreshCtx, refreshCancel := context.WithCancel(context.Background())
+		g.Add(func() error {
+			ticker := time.NewTicker(revocationRefreshInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-refreshCtx.Done():
+					return nil
+				case <-ticker.C:
+					if err := revocationCache.Refresh(refreshCtx, revocationFetcher); err != nil {
+						log.Printf("WARN: revocation refresh failed, keeping last state: %v", err)
+					}
+				}
+			}
+		}, func(error) { refreshCancel() })
+	}
 	{
 		specialTables := map[string]string{
 			"logs":   "otel_logs",
@@ -270,11 +312,28 @@ func main() {
 				http.Error(w, "Client certificate required", http.StatusForbidden)
 				return
 			}
+
+			claims, ok := certauth.ExtractClaims(r.TLS)
+			if !ok {
+				http.Error(w, "Certificate must contain ClusterName, Owner, and EnableTenant in OU fields", http.StatusForbidden)
+				return
+			}
+
+			if ownerRevoked, clusterRevoked := revocationCache.IsRevoked(claims.Owner, claims.ClusterName); ownerRevoked || clusterRevoked {
+				if ownerRevoked {
+					http.Error(w, fmt.Sprintf("tenant %q is revoked", claims.Owner), http.StatusForbidden)
+				} else {
+					http.Error(w, fmt.Sprintf("cluster %q is revoked", claims.ClusterName), http.StatusForbidden)
+				}
+				return
+			}
+
 			// Identity extraction: Prefer Thanos-Tenant header, fallback to Cert CN if needed.
 			tenant := r.Header.Get("Thanos-Tenant")
-			if tenant == "" {
-				tenant = "default"
+			if tenant == "" || tenant == "default" {
+				tenant = claims.Owner
 			}
+			r.Header.Set("Thanos-Tenant", tenant)
 
 			if !isPushPath(r.URL.Path) {
 				// Query paths (e.g. /api/v1/query) require the tenant_id label
@@ -288,11 +347,19 @@ func main() {
 				}
 			}
 
-			// If the identified tenant is not "default", verify the certificate has the required OU.
-			if tenant != "default" && certAuthOU != "" {
-				if ok := certauth.HasOU(r.TLS, certAuthOU); !ok {
-					http.Error(w, fmt.Sprintf("Certificate missing required OU for non-default tenant %s", tenant), http.StatusForbidden)
-					return
+			if !claims.EnableTenant {
+				switch {
+				case strings.HasPrefix(r.URL.Path, "/api/v1/receive"):
+					if tenant != claims.Owner {
+						http.Error(w, fmt.Sprintf("tenant_id %q does not match certificate owner %q", tenant, claims.Owner), http.StatusBadRequest)
+						return
+					}
+				case strings.HasPrefix(r.URL.Path, "/api/v1/logs"), strings.HasPrefix(r.URL.Path, "/api/v1/traces"):
+					expectedDB := getDBName(claims.Owner, claims.ClusterName)
+					if db := r.URL.Query().Get("database"); db != "" && db != expectedDB {
+						http.Error(w, fmt.Sprintf("database %q does not match expected %q for owner", db, expectedDB), http.StatusBadRequest)
+						return
+					}
 				}
 			}
 
@@ -608,7 +675,7 @@ func enforceNamespace(w http.ResponseWriter, r *http.Request, owner string, isCl
 	}
 
 	if !isClientOrg {
-		set("tenant_id", "default")
+		set("tenant_id", owner)
 		if isFormPost {
 			encoded := r.Form.Encode()
 			r.Body = io.NopCloser(strings.NewReader(encoded))
