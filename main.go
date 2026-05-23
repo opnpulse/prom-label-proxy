@@ -47,6 +47,9 @@ import (
 	"github.com/prometheus/prometheus/promql/parser"
 )
 
+// certClaimsKey is the context key for storing CertClaims extracted by withCertAuth.
+type certClaimsKey struct{}
+
 type arrayFlags []string
 
 // String is the method to format the flag's value, part of the flag.Value interface.
@@ -300,93 +303,93 @@ func main() {
 			_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
 		})
 
-		// Handler for push endpoints without tenant in path.
-		// It extracts the tenant ID from the client certificate's Common Name.
-		pushHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if !requireClientCert {
-				http.Error(w, "Client certificate required for this endpoint", http.StatusForbidden)
-				return
-			}
-
-			if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
-				http.Error(w, "Client certificate required", http.StatusForbidden)
-				return
-			}
-
-			claims, ok := certauth.ExtractClaims(r.TLS)
-			if !ok {
-				http.Error(w, "Certificate must contain ClusterName, Owner, and EnableTenant in OU fields", http.StatusForbidden)
-				return
-			}
-
-			if ownerRevoked, clusterRevoked := revocationCache.IsRevoked(claims.Owner, claims.ClusterName); ownerRevoked || clusterRevoked {
-				if ownerRevoked {
-					http.Error(w, fmt.Sprintf("tenant %q is revoked", claims.Owner), http.StatusForbidden)
-				} else {
-					http.Error(w, fmt.Sprintf("cluster %q is revoked", claims.ClusterName), http.StatusForbidden)
+		// withCertAuth validates the client certificate, checks revocation, and
+		// injects the claims into the request context for downstream handlers.
+		withCertAuth := func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if !requireClientCert {
+					http.Error(w, "Client certificate required for this endpoint", http.StatusForbidden)
+					return
 				}
-				return
-			}
+				if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
+					http.Error(w, "Client certificate required", http.StatusForbidden)
+					return
+				}
+				claims, ok := certauth.ExtractClaims(r.TLS)
+				if !ok {
+					http.Error(w, "Certificate must contain ClusterName, Owner, and EnableTenant in OU fields", http.StatusForbidden)
+					return
+				}
+				if ownerRevoked, clusterRevoked := revocationCache.IsRevoked(claims.Owner, claims.ClusterName); ownerRevoked || clusterRevoked {
+					if ownerRevoked {
+						http.Error(w, fmt.Sprintf("tenant %q is revoked", claims.Owner), http.StatusForbidden)
+					} else {
+						http.Error(w, fmt.Sprintf("cluster %q is revoked", claims.ClusterName), http.StatusForbidden)
+					}
+					return
+				}
+				next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), certClaimsKey{}, claims)))
+			})
+		}
 
-			// Identity extraction: Prefer Thanos-Tenant header, fallback to Cert CN if needed.
+		// receiveHandler enforces tenant ownership for metric push (Thanos Remote Write).
+		receiveHandler := withCertAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			claims := r.Context().Value(certClaimsKey{}).(certauth.CertClaims)
 			tenant := r.Header.Get("Thanos-Tenant")
-			if tenant == "" || tenant == "default" {
+			if tenant == "default" {
 				tenant = claims.Owner
-			}
-			r.Header.Set("Thanos-Tenant", tenant)
-
-			if !isPushPath(r.URL.Path) {
-				// Query paths (e.g. /api/v1/query) require the tenant_id label
-				// param to be set. Inject "default" so the proxy's enforcement
-				// is satisfied; the header-based tenant is only used for push
-				// paths (receive / logs / traces).
-				q := r.URL.Query()
-				if q.Get("tenant_id") == "" {
-					q.Set("tenant_id", "default")
-					r.URL.RawQuery = q.Encode()
-				}
+				r.Header.Set("Thanos-Tenant", tenant)
 			}
 
 			if !claims.EnableTenant {
-				switch {
-				case strings.HasPrefix(r.URL.Path, "/api/v1/receive"):
-					if tenant != claims.Owner {
-						http.Error(w, fmt.Sprintf("tenant_id %q does not match certificate owner %q", tenant, claims.Owner), http.StatusBadRequest)
-						return
-					}
-				case strings.HasPrefix(r.URL.Path, "/api/v1/logs"), strings.HasPrefix(r.URL.Path, "/api/v1/traces"):
-					expectedDB := getDBName(claims.Owner, claims.ClusterName)
-					if db := r.URL.Query().Get("database"); db != "" && db != expectedDB {
-						http.Error(w, fmt.Sprintf("database %q does not match expected %q for owner", db, expectedDB), http.StatusBadRequest)
-						return
-					}
+				if tenant != claims.Owner {
+					http.Error(w, fmt.Sprintf("tenant_id %q does not match certificate owner %q", tenant, claims.Owner), http.StatusBadRequest)
+					return
 				}
-			}
-
-			if tenant != claims.Owner && claims.EnableTenant {
+			} else if tenant != claims.Owner {
 				if resolvedID, ok := revocationCache.ResolveTenantID(tenant); ok {
-					tenant = resolvedID
-					r.Header.Set("Thanos-Tenant", tenant)
+					r.Header.Set("Thanos-Tenant", resolvedID)
+				}
+			}
+			routes.ServeHTTP(w, r)
+		}))
+
+		// logsTracesHandler enforces database ownership for ClickHouse push (logs/traces).
+		logsTracesHandler := withCertAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			claims := r.Context().Value(certClaimsKey{}).(certauth.CertClaims)
+
+			if !claims.EnableTenant {
+				expectedDB := getDBName(claims.Owner, claims.ClusterName)
+				if db := r.URL.Query().Get("database"); db != "" && db != expectedDB {
+					http.Error(w, fmt.Sprintf("database %q does not match expected %q for owner", db, expectedDB), http.StatusBadRequest)
+					return
 				}
 			}
 
-			isClickHouse := r.URL.Path == "/api/v1/logs" || r.URL.Path == "/api/v1/traces"
-			if isClickHouse {
-				chUser := os.Getenv("CLICKHOUSE_USER")
-				chPass := os.Getenv("CLICKHOUSE_PASSWORD")
-				if chUser != "" && chPass != "" {
-					r.Header.Set("X-Clickhouse-User", chUser)
-					r.Header.Set("X-Clickhouse-Key", chPass)
-				}
+			if chUser, chPass := os.Getenv("CLICKHOUSE_USER"), os.Getenv("CLICKHOUSE_PASSWORD"); chUser != "" && chPass != "" {
+				r.Header.Set("X-Clickhouse-User", chUser)
+				r.Header.Set("X-Clickhouse-Key", chPass)
 			}
 
 			routes.ServeHTTP(w, r)
-		})
+		}))
 
-		mux.Handle("/api/v1/", pushHandler)
-		mux.Handle("/api/v1/receive", pushHandler)
-		mux.Handle("/api/v1/logs", pushHandler)
-		mux.Handle("/api/v1/traces", pushHandler)
+		// apiHandler handles all other /api/v1/ query paths (e.g. /api/v1/query, /api/v1/query_range).
+		// It injects tenant_id=default so the proxy's label enforcement is satisfied.
+		apiHandler := withCertAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			q := r.URL.Query()
+			if q.Get("tenant_id") == "" {
+				q.Set("tenant_id", "default")
+				r.URL.RawQuery = q.Encode()
+			}
+
+			routes.ServeHTTP(w, r)
+		}))
+
+		mux.Handle("/api/v1/receive", receiveHandler)
+		mux.Handle("/api/v1/logs", logsTracesHandler)
+		mux.Handle("/api/v1/traces", logsTracesHandler)
+		mux.Handle("/api/v1/", apiHandler)
 
 		mux.Handle("/telemetry/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			path := strings.TrimPrefix(r.URL.Path, "/telemetry/")
@@ -407,11 +410,7 @@ func main() {
 			restParts := strings.SplitN(strings.TrimPrefix(rest, "/"), "/", 2)
 			secondSegment := restParts[0]
 			if table, ok := specialTables[secondSegment]; ok {
-				tenant := "default"
-				if resp.ClientOrg == "true" {
-					tenant = resp.Owner
-				}
-				updateQueryParams(r, getDBName(tenant, resp.ClusterName), table)
+				updateQueryParams(r, getDBName(resp.TenantID, resp.ClusterName), table)
 			} else {
 				if !enforceNamespace(w, r, resp.Owner, resp.ClientOrg == "true") {
 					return
@@ -508,6 +507,7 @@ type authResp struct {
 	Owner       string `json:"owner"`
 	ClusterName string `json:"clusterName"`
 	ClientOrg   string `json:"clientOrg"`
+	TenantID    string `json:"tenantID"`
 }
 
 func authorize(req *http.Request, uidcid string) (*authResp, error) {
@@ -585,10 +585,6 @@ func encodeCertPEM(cert *x509.Certificate) []byte {
 		Bytes: cert.Raw,
 	}
 	return pem.EncodeToMemory(&block)
-}
-
-func isPushPath(path string) bool {
-	return strings.HasPrefix(path, "/api/v1/receive") || strings.HasPrefix(path, "/api/v1/logs") || strings.HasPrefix(path, "/api/v1/traces")
 }
 
 var errMismatchedNamespace = errors.New("mismatched namespace")

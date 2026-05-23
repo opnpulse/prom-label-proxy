@@ -362,38 +362,9 @@ func NewRoutes(upstream *url.URL, label string, extractLabeler ExtractLabeler, o
 
 	proxy := httputil.NewSingleHostReverseProxy(upstream)
 
-	logsUrlFromEnv := os.Getenv("LOGS_URL")
-	logsURL, err := url.Parse(logsUrlFromEnv)
-	if err != nil {
-		log.Fatalf("Failed to build parse logs URL: %v", err)
-	}
-
-	if logsURL.Scheme != "http" && logsURL.Scheme != "https" {
-		log.Fatalf("Invalid scheme for logs URL %q, only 'http' and 'https' are supported", upstream)
-	}
-	logsHandler := httputil.NewSingleHostReverseProxy(logsURL)
-
-	tracesUrlFromEnv := os.Getenv("TRACES_URL")
-	tracesURL, err := url.Parse(tracesUrlFromEnv)
-	if err != nil {
-		log.Fatalf("Failed to build parse traces URL: %v", err)
-	}
-
-	if tracesURL.Scheme != "http" && tracesURL.Scheme != "https" {
-		log.Fatalf("Invalid scheme for traces URL %q, only 'http' and 'https' are supported", upstream)
-	}
-	tracesHandler := httputil.NewSingleHostReverseProxy(tracesURL)
-
-	thanosReceiverUrlFromEnv := os.Getenv("METRICS_URL")
-	thanosReceiverURL, err := url.Parse(thanosReceiverUrlFromEnv)
-	if err != nil {
-		log.Fatalf("Failed to build parse traces URL: %v", err)
-	}
-
-	if thanosReceiverURL.Scheme != "http" && thanosReceiverURL.Scheme != "https" {
-		log.Fatalf("Invalid scheme for metruc URL %q, only 'http' and 'https' are supported", upstream)
-	}
-	thanosRecieverHandler := httputil.NewSingleHostReverseProxy(thanosReceiverURL)
+	logsHandler := mustProxyBackend("LOGS_URL")
+	tracesHandler := mustProxyBackend("TRACES_URL")
+	thanosRecieverHandler := mustProxyBackend("METRICS_URL")
 
 	r := &routes{
 		upstream:              upstream,
@@ -496,8 +467,6 @@ func NewRoutes(upstream *url.URL, label string, extractLabeler ExtractLabeler, o
 
 		mux.Handle("/api/v1/traces", http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 			req.URL.Path = "/"
-			//req.TLS = nil
-			//req.Header.Del("Authorization")
 			r.tracesHandler.ServeHTTP(w, req)
 		})),
 	)
@@ -875,4 +844,16 @@ func trimValues(slice []string) []string {
 	}
 
 	return slice
+}
+
+func mustProxyBackend(envVar string) *httputil.ReverseProxy {
+	raw := os.Getenv(envVar)
+	u, err := url.Parse(raw)
+	if err != nil {
+		log.Fatalf("failed to parse %s URL: %v", envVar, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		log.Fatalf("invalid scheme for %s URL %q, only 'http' and 'https' are supported", envVar, raw)
+	}
+	return httputil.NewSingleHostReverseProxy(u)
 }
