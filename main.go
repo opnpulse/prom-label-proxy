@@ -22,6 +22,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -31,6 +32,7 @@ import (
 	"regexp"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/metalmatze/signal/internalserver"
 	"github.com/oklog/run"
@@ -39,8 +41,14 @@ import (
 
 	"github.com/prometheus-community/prom-label-proxy/certauth"
 	"github.com/prometheus-community/prom-label-proxy/injectproxy"
+	"github.com/prometheus-community/prom-label-proxy/revocation"
 	"github.com/prometheus-community/prom-label-proxy/tlsconfig"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/promql/parser"
 )
+
+// certClaimsKey is the context key for storing CertClaims extracted by withCertAuth.
+type certClaimsKey struct{}
 
 type arrayFlags []string
 
@@ -88,6 +96,9 @@ func main() {
 		tlsCAFile         string
 		requireClientCert bool
 		certAuthOU        string
+		// Revocation flags
+		revocationRefreshInterval time.Duration
+		revocationStartupTimeout  time.Duration
 	)
 
 	flagset := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
@@ -121,6 +132,11 @@ func main() {
 	flagset.StringVar(&tlsCAFile, "tls-ca-file", "", "Path to the CA certificate for verifying client certificates.")
 	flagset.BoolVar(&requireClientCert, "require-client-cert", false, "When true, requires a client certificate for all requests.")
 	flagset.StringVar(&certAuthOU, "cert-auth-ou", "", "Required OU field in client certificate for authorization (e.g. EnableTenant=True).")
+	// Revocation flags
+	flagset.DurationVar(&revocationRefreshInterval, "revocation-refresh-interval", 30*time.Second,
+		"How often to refresh the revocation list from the platform API server.")
+	flagset.DurationVar(&revocationStartupTimeout, "revocation-startup-timeout", 30*time.Second,
+		"Maximum time to wait for the initial revocation list fetch before aborting startup.")
 
 	//nolint: errcheck // Parse() will exit on error.
 	flagset.Parse(os.Args[1:])
@@ -231,7 +247,39 @@ func main() {
 		extractLabeler = injectproxy.HTTPHeaderEnforcer{Name: http.CanonicalHeaderKey(headerName), ParseListSyntax: headerUsesListSyntax}
 	}
 
+	// Revocation cache: blocking initial fetch then background refresh.
+	revocationCache := revocation.NewCache()
+	revocationFetcher, err := revocation.NewFetcher()
+	if err != nil {
+		log.Fatalf("Failed to create revocation fetcher: %v", err)
+	}
+	{
+		startCtx, startCancel := context.WithTimeout(context.Background(), revocationStartupTimeout)
+		if err := revocationCache.FetchOnce(startCtx, revocationFetcher); err != nil {
+			log.Fatalf("Failed to load initial revocation list: %v", err)
+		}
+		startCancel()
+		log.Printf("Revocation cache loaded")
+	}
+
 	var g run.Group
+	{
+		refreshCtx, refreshCancel := context.WithCancel(context.Background())
+		g.Add(func() error {
+			ticker := time.NewTicker(revocationRefreshInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-refreshCtx.Done():
+					return nil
+				case <-ticker.C:
+					if err := revocationCache.Refresh(refreshCtx, revocationFetcher); err != nil {
+						log.Printf("WARN: revocation refresh failed, keeping last state: %v", err)
+					}
+				}
+			}
+		}, func(error) { refreshCancel() })
+	}
 	{
 		specialTables := map[string]string{
 			"logs":   "otel_logs",
@@ -255,61 +303,93 @@ func main() {
 			_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
 		})
 
-		// Handler for push endpoints without tenant in path.
-		// It extracts the tenant ID from the client certificate's Common Name.
-		pushHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if !requireClientCert {
-				http.Error(w, "Client certificate required for this endpoint", http.StatusForbidden)
-				return
-			}
+		// withCertAuth validates the client certificate, checks revocation, and
+		// injects the claims into the request context for downstream handlers.
+		withCertAuth := func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if !requireClientCert {
+					http.Error(w, "Client certificate required for this endpoint", http.StatusForbidden)
+					return
+				}
+				if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
+					http.Error(w, "Client certificate required", http.StatusForbidden)
+					return
+				}
+				claims, ok := certauth.ExtractClaims(r.TLS)
+				if !ok {
+					http.Error(w, "Certificate must contain ClusterName, Owner, and EnableTenant in OU fields", http.StatusForbidden)
+					return
+				}
+				if ownerRevoked, clusterRevoked := revocationCache.IsRevoked(claims.Owner, claims.ClusterName); ownerRevoked || clusterRevoked {
+					if ownerRevoked {
+						http.Error(w, fmt.Sprintf("tenant %q is revoked", claims.Owner), http.StatusForbidden)
+					} else {
+						http.Error(w, fmt.Sprintf("cluster %q is revoked", claims.ClusterName), http.StatusForbidden)
+					}
+					return
+				}
+				next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), certClaimsKey{}, claims)))
+			})
+		}
 
-			if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
-				http.Error(w, "Client certificate required", http.StatusForbidden)
-				return
-			}
-			// Identity extraction: Prefer Thanos-Tenant header, fallback to Cert CN if needed.
+		// receiveHandler enforces tenant ownership for metric push (Thanos Remote Write).
+		receiveHandler := withCertAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			claims := r.Context().Value(certClaimsKey{}).(certauth.CertClaims)
 			tenant := r.Header.Get("Thanos-Tenant")
-			if tenant == "" {
-				tenant = "default"
+			if tenant == "default" {
+				tenant = claims.Owner
+				r.Header.Set("Thanos-Tenant", tenant)
 			}
 
-			if !isPushPath(r.URL.Path) {
-				// Query paths (e.g. /api/v1/query) require the tenant_id label
-				// param to be set. Inject "default" so the proxy's enforcement
-				// is satisfied; the header-based tenant is only used for push
-				// paths (receive / logs / traces).
-				q := r.URL.Query()
-				if q.Get("tenant_id") == "" {
-					q.Set("tenant_id", "default")
-					r.URL.RawQuery = q.Encode()
+			if !claims.EnableTenant {
+				if tenant != claims.Owner {
+					http.Error(w, fmt.Sprintf("tenant_id %q does not match certificate owner %q", tenant, claims.Owner), http.StatusBadRequest)
+					return
+				}
+			} else if tenant != claims.Owner {
+				if resolvedID, ok := revocationCache.ResolveTenantID(tenant); ok {
+					r.Header.Set("Thanos-Tenant", resolvedID)
 				}
 			}
+			routes.ServeHTTP(w, r)
+		}))
 
-			// If the identified tenant is not "default", verify the certificate has the required OU.
-			if tenant != "default" && certAuthOU != "" {
-				if ok := certauth.HasOU(r.TLS, certAuthOU); !ok {
-					http.Error(w, fmt.Sprintf("Certificate missing required OU for non-default tenant %s", tenant), http.StatusForbidden)
+		// logsTracesHandler enforces database ownership for ClickHouse push (logs/traces).
+		logsTracesHandler := withCertAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			claims := r.Context().Value(certClaimsKey{}).(certauth.CertClaims)
+
+			if !claims.EnableTenant {
+				expectedDB := getDBName(claims.Owner, claims.ClusterName)
+				if db := r.URL.Query().Get("database"); db != "" && db != expectedDB {
+					http.Error(w, fmt.Sprintf("database %q does not match expected %q for owner", db, expectedDB), http.StatusBadRequest)
 					return
 				}
 			}
 
-			isClickHouse := r.URL.Path == "/api/v1/logs" || r.URL.Path == "/api/v1/traces"
-			if isClickHouse {
-				chUser := os.Getenv("CLICKHOUSE_USER")
-				chPass := os.Getenv("CLICKHOUSE_PASSWORD")
-				if chUser != "" && chPass != "" {
-					r.Header.Set("X-Clickhouse-User", chUser)
-					r.Header.Set("X-Clickhouse-Key", chPass)
-				}
+			if chUser, chPass := os.Getenv("CLICKHOUSE_USER"), os.Getenv("CLICKHOUSE_PASSWORD"); chUser != "" && chPass != "" {
+				r.Header.Set("X-Clickhouse-User", chUser)
+				r.Header.Set("X-Clickhouse-Key", chPass)
 			}
 
 			routes.ServeHTTP(w, r)
-		})
+		}))
 
-		mux.Handle("/api/v1/", pushHandler)
-		mux.Handle("/api/v1/receive", pushHandler)
-		mux.Handle("/api/v1/logs", pushHandler)
-		mux.Handle("/api/v1/traces", pushHandler)
+		// apiHandler handles all other /api/v1/ query paths (e.g. /api/v1/query, /api/v1/query_range).
+		// It injects tenant_id=default so the proxy's label enforcement is satisfied.
+		apiHandler := withCertAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			q := r.URL.Query()
+			if q.Get("tenant_id") == "" {
+				q.Set("tenant_id", "default")
+				r.URL.RawQuery = q.Encode()
+			}
+
+			routes.ServeHTTP(w, r)
+		}))
+
+		mux.Handle("/api/v1/receive", receiveHandler)
+		mux.Handle("/api/v1/logs", logsTracesHandler)
+		mux.Handle("/api/v1/traces", logsTracesHandler)
+		mux.Handle("/api/v1/", apiHandler)
 
 		mux.Handle("/telemetry/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			path := strings.TrimPrefix(r.URL.Path, "/telemetry/")
@@ -330,21 +410,11 @@ func main() {
 			restParts := strings.SplitN(strings.TrimPrefix(rest, "/"), "/", 2)
 			secondSegment := restParts[0]
 			if table, ok := specialTables[secondSegment]; ok {
-				tenant := "default"
-				if resp.ClientOrg == "true" {
-					tenant = resp.Owner
-				}
-
-				updateQueryParams(r, getDBName(tenant, resp.ClusterName), table)
+				updateQueryParams(r, getDBName(resp.TenantID, resp.ClusterName), table)
 			} else {
-				// normal Prometheus path
-				q := r.URL.Query()
-				if resp.ClientOrg == "true" {
-					q.Set("tenant_id", resp.Owner)
-				} else {
-					q.Set("tenant_id", "default")
+				if !enforceNamespace(w, r, resp.Owner, resp.ClientOrg == "true") {
+					return
 				}
-				r.URL.RawQuery = q.Encode()
 			}
 
 			r.URL.Path = "/" + strings.TrimPrefix(parts[1], "/")
@@ -437,6 +507,7 @@ type authResp struct {
 	Owner       string `json:"owner"`
 	ClusterName string `json:"clusterName"`
 	ClientOrg   string `json:"clientOrg"`
+	TenantID    string `json:"tenantID"`
 }
 
 func authorize(req *http.Request, uidcid string) (*authResp, error) {
@@ -516,6 +587,150 @@ func encodeCertPEM(cert *x509.Certificate) []byte {
 	return pem.EncodeToMemory(&block)
 }
 
-func isPushPath(path string) bool {
-	return strings.HasPrefix(path, "/api/v1/receive") || strings.HasPrefix(path, "/api/v1/logs") || strings.HasPrefix(path, "/api/v1/traces")
+var errMismatchedNamespace = errors.New("mismatched namespace")
+
+type namespaceRewriter struct {
+	owner string
+}
+
+func (r *namespaceRewriter) Visit(node parser.Node, path []parser.Node) (parser.Visitor, error) {
+	if node == nil {
+		return nil, nil
+	}
+	switch n := node.(type) {
+	case *parser.VectorSelector:
+		found := false
+		for _, m := range n.LabelMatchers {
+			if m.Name == "namespace" {
+				if m.Value != r.owner {
+					return nil, errMismatchedNamespace
+				}
+				// It matches the owner; nothing to rewrite.
+				found = true
+			}
+		}
+		if !found {
+			n.LabelMatchers = append(n.LabelMatchers, &labels.Matcher{
+				Type:  labels.MatchEqual,
+				Name:  "namespace",
+				Value: r.owner,
+			})
+		}
+	}
+	return r, nil
+}
+
+func rewriteNamespace(query, owner string) (string, error) {
+	expr, err := parser.NewParser(parser.Options{}).ParseExpr(query)
+	if err != nil {
+		return query, err
+	}
+	if err := parser.Walk(&namespaceRewriter{owner: owner}, expr, nil); err != nil {
+		return query, err
+	}
+	return expr.String(), nil
+}
+
+// enforceNamespace rewrites the namespace label in all Prometheus query params
+// of r to owner (when isClientOrg is true), or sets tenant_id to "default".
+// It handles both GET (URL query params) and POST (application/x-www-form-urlencoded body).
+// Returns false if it already wrote an HTTP error response.
+func enforceNamespace(w http.ResponseWriter, r *http.Request, owner string, isClientOrg bool) bool {
+	isFormPost := r.Method == http.MethodPost &&
+		strings.Contains(r.Header.Get("Content-Type"), "application/x-www-form-urlencoded")
+	if isFormPost {
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, "failed to parse form: "+err.Error(), http.StatusBadRequest)
+			return false
+		}
+	}
+
+	// get/set abstract over URL params vs POST body.
+	get := func(key string) string {
+		if isFormPost {
+			return r.Form.Get(key)
+		}
+		return r.URL.Query().Get(key)
+	}
+	set := func(key, val string) {
+		if isFormPost {
+			r.Form.Set(key, val)
+			return
+		}
+		q := r.URL.Query()
+		q.Set(key, val)
+		r.URL.RawQuery = q.Encode()
+	}
+	getSlice := func(key string) []string {
+		if isFormPost {
+			return r.Form[key]
+		}
+		return r.URL.Query()[key]
+	}
+	setSlice := func(key string, vals []string) {
+		if isFormPost {
+			r.Form[key] = vals
+			return
+		}
+		q := r.URL.Query()
+		q[key] = vals
+		r.URL.RawQuery = q.Encode()
+	}
+
+	if !isClientOrg {
+		set("tenant_id", owner)
+		if isFormPost {
+			encoded := r.Form.Encode()
+			r.Body = io.NopCloser(strings.NewReader(encoded))
+			r.ContentLength = int64(len(encoded))
+			r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		}
+		return true
+	}
+
+	// applyNamespace injects namespace=owner, or validates an existing one. If an existing namespace
+	// is present but does not match owner, it returns a 403 Forbidden.
+	applyNamespace := func(expr string) (string, bool) {
+		out, err := rewriteNamespace(expr, owner)
+		if err != nil {
+			if errors.Is(err, errMismatchedNamespace) {
+				http.Error(w, "namespace label does not match owner", http.StatusForbidden)
+				return "", false
+			}
+			http.Error(w, "invalid query: "+err.Error(), http.StatusBadRequest)
+			return "", false
+		}
+		return out, true
+	}
+
+	if query := get("query"); query != "" {
+		out, ok := applyNamespace(query)
+		if !ok {
+			return false
+		}
+		set("query", out)
+	}
+
+	// Rewrite "match[]" params (label APIs).
+	matchers := getSlice("match[]")
+	for i, m := range matchers {
+		out, ok := applyNamespace(m)
+		if !ok {
+			return false
+		}
+		matchers[i] = out
+	}
+	if len(matchers) > 0 {
+		setSlice("match[]", matchers)
+	}
+	set("tenant_id", owner)
+
+	// Rebuild POST body after modifications.
+	if isFormPost {
+		encoded := r.Form.Encode()
+		r.Body = io.NopCloser(strings.NewReader(encoded))
+		r.ContentLength = int64(len(encoded))
+		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	}
+	return true
 }
