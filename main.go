@@ -41,7 +41,7 @@ import (
 
 	"github.com/prometheus-community/prom-label-proxy/certauth"
 	"github.com/prometheus-community/prom-label-proxy/injectproxy"
-	"github.com/prometheus-community/prom-label-proxy/revocation"
+	"github.com/prometheus-community/prom-label-proxy/tenants"
 	"github.com/prometheus-community/prom-label-proxy/tlsconfig"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql/parser"
@@ -72,6 +72,8 @@ func main() {
 	var (
 		insecureListenAddress           string
 		internalListenAddress           string
+		forwarderListenAddress          string
+		forwarderClientName             string
 		upstream                        string
 		upstreamCaCert                  string
 		queryParam                      string
@@ -104,6 +106,8 @@ func main() {
 	flagset := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
 	flagset.StringVar(&insecureListenAddress, "insecure-listen-address", "", "The address the prom-label-proxy HTTP server should listen on.")
 	flagset.StringVar(&internalListenAddress, "internal-listen-address", "", "The address the internal prom-label-proxy HTTP server should listen on to expose metrics about itself.")
+	flagset.StringVar(&forwarderListenAddress, "forwarder-listen-address", "", "Address for the central forwarder's write path, which names its cluster in a header instead of a certificate. Requires -forwarder-client-name and the same TLS flags as the main listener.")
+	flagset.StringVar(&forwarderClientName, "forwarder-client-name", "", "The only client certificate identity allowed to name a cluster in a header on the forwarder listener. Matched against the certificate's DNS SANs and common name.")
 	flagset.StringVar(&queryParam, "query-param", "", "Name of the HTTP parameter that contains the tenant value. At most one of -query-param, -header-name and -label-value should be given. If the flag isn't defined and neither -header-name nor -label-value is set, it will default to the value of the -label flag.")
 	flagset.StringVar(&headerName, "header-name", "", "Name of the HTTP header name that contains the tenant value. At most one of -query-param, -header-name and -label-value should be given.")
 	flagset.StringVar(&upstream, "upstream", "", "The upstream URL to proxy to.")
@@ -134,9 +138,9 @@ func main() {
 	flagset.StringVar(&certAuthOU, "cert-auth-ou", "", "Required OU field in client certificate for authorization (e.g. EnableTenant=True).")
 	// Revocation flags
 	flagset.DurationVar(&revocationRefreshInterval, "revocation-refresh-interval", 30*time.Second,
-		"How often to refresh the revocation list from the platform API server.")
+		"How often to refresh the tenant list, which carries both revocations and backend routing.")
 	flagset.DurationVar(&revocationStartupTimeout, "revocation-startup-timeout", 30*time.Second,
-		"Maximum time to wait for the initial revocation list fetch before aborting startup.")
+		"Maximum time to wait for the initial tenant list fetch before aborting startup.")
 
 	//nolint: errcheck // Parse() will exit on error.
 	flagset.Parse(os.Args[1:])
@@ -248,18 +252,18 @@ func main() {
 	}
 
 	// Revocation cache: blocking initial fetch then background refresh.
-	revocationCache := revocation.NewCache()
-	revocationFetcher, err := revocation.NewFetcher()
+	tenantCache := tenants.NewCache()
+	tenantFetcher, err := tenants.NewFetcher()
 	if err != nil {
-		log.Fatalf("Failed to create revocation fetcher: %v", err)
+		log.Fatalf("Failed to create tenant fetcher: %v", err)
 	}
 	{
 		startCtx, startCancel := context.WithTimeout(context.Background(), revocationStartupTimeout)
-		if err := revocationCache.FetchOnce(startCtx, revocationFetcher); err != nil {
-			log.Fatalf("Failed to load initial revocation list: %v", err)
+		if err := tenantCache.FetchOnce(startCtx, tenantFetcher); err != nil {
+			log.Fatalf("Failed to load initial tenant list: %v", err)
 		}
 		startCancel()
-		log.Printf("Revocation cache loaded")
+		log.Printf("Tenant cache loaded")
 	}
 
 	var g run.Group
@@ -273,8 +277,8 @@ func main() {
 				case <-refreshCtx.Done():
 					return nil
 				case <-ticker.C:
-					if err := revocationCache.Refresh(refreshCtx, revocationFetcher); err != nil {
-						log.Printf("WARN: revocation refresh failed, keeping last state: %v", err)
+					if err := tenantCache.Refresh(refreshCtx, tenantFetcher); err != nil {
+						log.Printf("WARN: tenant refresh failed, keeping last state: %v", err)
 					}
 				}
 			}
@@ -320,7 +324,7 @@ func main() {
 					http.Error(w, "Certificate must contain ClusterName, Owner, and EnableTenant in OU fields", http.StatusForbidden)
 					return
 				}
-				if ownerRevoked, clusterRevoked := revocationCache.IsRevoked(claims.Owner, claims.ClusterName); ownerRevoked || clusterRevoked {
+				if ownerRevoked, clusterRevoked := tenantCache.IsRevoked(claims.Owner, claims.ClusterName); ownerRevoked || clusterRevoked {
 					if ownerRevoked {
 						http.Error(w, fmt.Sprintf("tenant %q is revoked", claims.Owner), http.StatusForbidden)
 					} else {
@@ -332,47 +336,119 @@ func main() {
 			})
 		}
 
-		// receiveHandler enforces tenant ownership for metric push (Thanos Remote Write).
-		receiveHandler := withCertAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			claims := r.Context().Value(certClaimsKey{}).(certauth.CertClaims)
+		// resolveWriteTenant returns the tenant a push belongs to. A cert speaks
+		// only for its own owner unless it carries the right to speak for others.
+		resolveWriteTenant := func(w http.ResponseWriter, r *http.Request, claims certauth.CertClaims) (string, bool) {
 			tenant := r.Header.Get("Thanos-Tenant")
-			if tenant == "default" {
-				tenant = claims.Owner
-				r.Header.Set("Thanos-Tenant", tenant)
+			if tenant == "" || tenant == "default" {
+				return claims.Owner, true
 			}
-
 			if !claims.EnableTenant {
 				if tenant != claims.Owner {
 					http.Error(w, fmt.Sprintf("tenant_id %q does not match certificate owner %q", tenant, claims.Owner), http.StatusBadRequest)
-					return
+					return "", false
 				}
-			} else if tenant != claims.Owner {
-				if resolvedID, ok := revocationCache.ResolveTenantID(tenant); ok {
-					r.Header.Set("Thanos-Tenant", resolvedID)
+				return tenant, true
+			}
+			if tenant != claims.Owner {
+				if resolvedID, ok := tenantCache.ResolveTenantID(tenant); ok {
+					return resolvedID, true
 				}
 			}
-			routes.ServeHTTP(w, r)
-		}))
+			return tenant, true
+		}
 
-		// logsTracesHandler enforces database ownership for ClickHouse push (logs/traces).
-		logsTracesHandler := withCertAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// routeForTenant looks up where a tenant's data lives, refusing rather than
+		// letting an unassigned tenant fall through to the default account.
+		routeForTenant := func(w http.ResponseWriter, tenant string) (tenants.Route, bool) {
+			route, ok := tenantCache.Route(tenant)
+			if !ok || !route.Addressable() {
+				http.Error(w, fmt.Sprintf("tenant %q has no backend account assigned yet", tenant), http.StatusServiceUnavailable)
+				return tenants.Route{}, false
+			}
+			return route, true
+		}
+
+		// receiveWrite enforces tenant ownership for metric push. Claims come from
+		// the context, so a certificate and the Tenant CR are equivalent here.
+		receiveWrite := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			claims := r.Context().Value(certClaimsKey{}).(certauth.CertClaims)
+			tenant, ok := resolveWriteTenant(w, r, claims)
+			if !ok {
+				return
+			}
+			r.Header.Set("Thanos-Tenant", tenant)
 
-			if !claims.EnableTenant {
-				expectedDB := getDBName(claims.Owner, claims.ClusterName)
-				if db := r.URL.Query().Get("database"); db != "" && db != expectedDB {
-					http.Error(w, fmt.Sprintf("database %q does not match expected %q for owner", db, expectedDB), http.StatusBadRequest)
+			// VictoriaMetrics takes the tenant from the URL rather than a header, so
+			// the effective tenant settled above is translated into a write path.
+			if tenantCache.Backends().Metrics == string(injectproxy.BackendVictoriaMetrics) {
+				route, ok := routeForTenant(w, tenant)
+				if !ok {
 					return
+				}
+				// An instance-per-tier stack sends the tenant to its own instance;
+				// a single instance stack leaves the upstream empty.
+				if tenantCache.Backends().VictoriaMetricsStandalone() {
+					r = r.WithContext(injectproxy.WithVictoriaMetricsSingleWrite(r.Context(), route.AccountID, route.ProjectID, route.Metrics.WriteURL))
+				} else {
+					r = r.WithContext(injectproxy.WithVictoriaMetricsWrite(r.Context(), route.AccountID, route.ProjectID, route.Metrics.WriteURL))
 				}
 			}
 
-			if chUser, chPass := os.Getenv("CLICKHOUSE_USER"), os.Getenv("CLICKHOUSE_PASSWORD"); chUser != "" && chPass != "" {
-				r.Header.Set("X-Clickhouse-User", chUser)
-				r.Header.Set("X-Clickhouse-Key", chPass)
+			routes.ServeHTTP(w, r)
+		})
+		receiveHandler := withCertAuth(receiveWrite)
+
+		// logsTracesWrite enforces tenant ownership for log and span push. The
+		// pillar comes from the path, since the two can run different backends.
+		logsTracesWrite := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			claims := r.Context().Value(certClaimsKey{}).(certauth.CertClaims)
+			isTraces := strings.HasPrefix(r.URL.Path, "/api/v1/traces")
+
+			backends := tenantCache.Backends()
+			backend := injectproxy.Backend(backends.Logs)
+			if isTraces {
+				backend = injectproxy.Backend(backends.Traces)
 			}
 
+			if backend == injectproxy.BackendVictoriaLogs || backend == injectproxy.BackendVictoriaTraces {
+				tenant, ok := resolveWriteTenant(w, r, claims)
+				if !ok {
+					return
+				}
+				route, ok := routeForTenant(w, tenant)
+				if !ok {
+					return
+				}
+
+				if isTraces {
+					r = r.WithContext(injectproxy.WithVictoriaTracesWrite(r.Context(), route.AccountID, route.ProjectID, route.Traces.WriteURL))
+				} else {
+					r = r.WithContext(injectproxy.WithVictoriaLogsWrite(r.Context(), route.AccountID, route.ProjectID, route.Logs.WriteURL))
+				}
+
+				routes.ServeHTTP(w, r)
+				return
+			}
+
+			// The database is derived from the settled tenant and overwritten,
+			// not compared: an absent one used to fall through to the default.
+			chTenant, ok := resolveWriteTenant(w, r, claims)
+			if !ok {
+				return
+			}
+			q := r.URL.Query()
+			q.Set("database", getDBName(chTenant, claims.ClusterName))
+			r.URL.RawQuery = q.Encode()
+
+			injectproxy.SetClickHouseCredentials(r.Header)
+			// Writes arrive on /api/v1/logs and /api/v1/traces; the inner router
+			// serves ClickHouse only under /logs and /traces.
+			r.URL.Path = injectproxy.ClickHouseWritePath(r.URL.Path)
+
 			routes.ServeHTTP(w, r)
-		}))
+		})
+		logsTracesHandler := withCertAuth(logsTracesWrite)
 
 		// apiHandler handles all other /api/v1/ query paths (e.g. /api/v1/query, /api/v1/query_range).
 		// It injects tenant_id=default so the proxy's label enforcement is satisfied.
@@ -410,16 +486,98 @@ func main() {
 			restParts := strings.SplitN(strings.TrimPrefix(rest, "/"), "/", 2)
 			secondSegment := restParts[0]
 			if table, ok := specialTables[secondSegment]; ok {
-				updateQueryParams(r, getDBName(resp.TenantID, resp.ClusterName), table)
-			} else {
-				if !enforceNamespace(w, r, resp.Owner, resp.ClientOrg == "true") {
+				isTraces := secondSegment == "traces"
+				backends := tenantCache.Backends()
+				backend := injectproxy.Backend(backends.Logs)
+				if isTraces {
+					backend = injectproxy.Backend(backends.Traces)
+				}
+
+				switch backend {
+				case injectproxy.BackendVictoriaLogs, injectproxy.BackendVictoriaTraces:
+					route, ok := routeForTenant(w, resp.TenantID)
+					if !ok {
+						return
+					}
+					if isTraces {
+						r = r.WithContext(injectproxy.WithVictoriaTracesSelect(r.Context(), route.AccountID, route.ProjectID, route.Traces.ReadURL))
+					} else {
+						// A client org sees only its own namespace. The parent org
+						// owns the whole account, so it needs no extra filter.
+						var extraFilters string
+						if resp.ClientOrg == "true" {
+							extraFilters = injectproxy.NamespaceExtraFilter(resp.Owner)
+						}
+						r = r.WithContext(injectproxy.WithVictoriaLogsSelect(r.Context(), route.AccountID, route.ProjectID, route.Logs.ReadURL, extraFilters))
+					}
+				default:
+					updateQueryParams(r, getDBName(resp.TenantID, resp.ClusterName), table)
+				}
+			} else if tenantCache.Backends().Metrics == string(injectproxy.BackendVictoriaMetrics) {
+				// The tenant is a path segment on VictoriaMetrics, so editing the
+				// query cannot widen it. Keyed by tenantID, not owner name.
+				route, ok := tenantCache.Route(resp.TenantID)
+				if !ok || !route.Addressable() {
+					http.Error(w, fmt.Sprintf("tenant %q has no backend account assigned yet", resp.TenantID), http.StatusServiceUnavailable)
 					return
 				}
+				// A client org is additionally confined to its own namespace.
+				if !enforceNamespace(w, r, resp.Owner, resp.ClientOrg == "true", false) {
+					return
+				}
+				if tenantCache.Backends().VictoriaMetricsStandalone() {
+					r = r.WithContext(injectproxy.WithVictoriaMetricsSingleSelect(r.Context(), route.AccountID, route.ProjectID, route.Metrics.ReadURL))
+				} else {
+					r = r.WithContext(injectproxy.WithVictoriaMetricsSelect(r.Context(), route.AccountID, route.ProjectID, route.Metrics.ReadURL))
+				}
+			} else if !enforceNamespace(w, r, resp.Owner, resp.ClientOrg == "true", true) {
+				return
 			}
 
 			r.URL.Path = "/" + strings.TrimPrefix(parts[1], "/")
 			routes.ServeHTTP(w, r)
 		}))
+
+		// The forwarder holds one certificate for every cluster, so the cluster
+		// comes from a header. Only the forwarder's own certificate is allowed
+		// to name one, which is what keeps the header from being a free claim.
+		withForwarderAuth := func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if err := verifyForwarderIdentity(r, forwarderClientName); err != nil {
+					http.Error(w, err.Error(), http.StatusForbidden)
+					return
+				}
+				cluster := r.Header.Get("X-Cluster-Name")
+				if cluster == "" {
+					http.Error(w, "X-Cluster-Name is required", http.StatusBadRequest)
+					return
+				}
+				stored, ok := tenantCache.ClusterClaims(cluster)
+				if !ok {
+					http.Error(w, fmt.Sprintf("unknown cluster %q", cluster), http.StatusForbidden)
+					return
+				}
+				claims := certauth.CertClaims{
+					ClusterName:  cluster,
+					Owner:        stored.Owner,
+					EnableTenant: stored.EnableTenant,
+				}
+				// The same check the certificate path makes, against the same
+				// cache, so revocation does not depend on how a caller arrived.
+				if ownerRevoked, clusterRevoked := tenantCache.IsRevoked(claims.Owner, cluster); ownerRevoked || clusterRevoked {
+					http.Error(w, fmt.Sprintf("cluster %q is revoked", cluster), http.StatusForbidden)
+					return
+				}
+				next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), certClaimsKey{}, claims)))
+			})
+		}
+
+		// Same handlers as a workload gateway, so there is one copy of the
+		// enforcement rather than two that can drift.
+		forwarderMux := http.NewServeMux()
+		forwarderMux.Handle("/api/v1/receive", withForwarderAuth(receiveWrite))
+		forwarderMux.Handle("/api/v1/logs", withForwarderAuth(logsTracesWrite))
+		forwarderMux.Handle("/api/v1/traces", withForwarderAuth(logsTracesWrite))
 
 		var l net.Listener
 		if tlsCertFile != "" && tlsKeyFile != "" {
@@ -449,6 +607,38 @@ func main() {
 				log.Fatalf("Failed to listen on insecure address: %v", err)
 			}
 			log.Printf("Listening insecurely on %v", l.Addr())
+		}
+
+		if forwarderListenAddress != "" {
+			if forwarderClientName == "" {
+				log.Fatalf("Refusing to serve the forwarder listener: -forwarder-client-name is required, since anything that reaches it can otherwise claim any cluster")
+			}
+			if tlsCertFile == "" || tlsKeyFile == "" || tlsCAFile == "" {
+				log.Fatalf("Refusing to serve the forwarder listener: it requires -tls-cert-file, -tls-key-file and -tls-ca-file")
+			}
+			ftls, err := tlsconfig.NewServerTLSConfig(tlsconfig.ServerConfig{
+				CertFile:   tlsCertFile,
+				KeyFile:    tlsKeyFile,
+				CAFile:     tlsCAFile,
+				ClientAuth: tls.RequireAndVerifyClientCert,
+			})
+			if err != nil {
+				log.Fatalf("Failed to create the forwarder TLS config: %v", err)
+			}
+			fl, err := tls.Listen("tcp", forwarderListenAddress, ftls)
+			if err != nil {
+				log.Fatalf("Failed to listen on forwarder address %s: %v", forwarderListenAddress, err)
+			}
+			fsrv := &http.Server{Handler: forwarderMux}
+			g.Add(func() error {
+				log.Printf("Listening for the forwarder on %v", fl.Addr())
+				if err := fsrv.Serve(fl); err != nil && err != http.ErrServerClosed {
+					return err
+				}
+				return nil
+			}, func(error) {
+				_ = fsrv.Close()
+			})
 		}
 
 		srv := &http.Server{Handler: mux}
@@ -635,7 +825,7 @@ func rewriteNamespace(query, owner string) (string, error) {
 // of r to owner (when isClientOrg is true), or sets tenant_id to "default".
 // It handles both GET (URL query params) and POST (application/x-www-form-urlencoded body).
 // Returns false if it already wrote an HTTP error response.
-func enforceNamespace(w http.ResponseWriter, r *http.Request, owner string, isClientOrg bool) bool {
+func enforceNamespace(w http.ResponseWriter, r *http.Request, owner string, isClientOrg, injectTenantID bool) bool {
 	isFormPost := r.Method == http.MethodPost &&
 		strings.Contains(r.Header.Get("Content-Type"), "application/x-www-form-urlencoded")
 	if isFormPost {
@@ -678,7 +868,9 @@ func enforceNamespace(w http.ResponseWriter, r *http.Request, owner string, isCl
 	}
 
 	if !isClientOrg {
-		set("tenant_id", owner)
+		if injectTenantID {
+			set("tenant_id", owner)
+		}
 		if isFormPost {
 			encoded := r.Form.Encode()
 			r.Body = io.NopCloser(strings.NewReader(encoded))
@@ -723,7 +915,9 @@ func enforceNamespace(w http.ResponseWriter, r *http.Request, owner string, isCl
 	if len(matchers) > 0 {
 		setSlice("match[]", matchers)
 	}
-	set("tenant_id", owner)
+	if injectTenantID {
+		set("tenant_id", owner)
+	}
 
 	// Rebuild POST body after modifications.
 	if isFormPost {
@@ -733,4 +927,22 @@ func enforceNamespace(w http.ResponseWriter, r *http.Request, owner string, isCl
 		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	}
 	return true
+}
+
+// verifyForwarderIdentity accepts only the forwarder's own certificate. The
+// header it sends names any cluster, so the identity behind it is the boundary.
+func verifyForwarderIdentity(r *http.Request, want string) error {
+	if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
+		return fmt.Errorf("a client certificate is required on the forwarder listener")
+	}
+	cert := r.TLS.PeerCertificates[0]
+	if cert.Subject.CommonName == want {
+		return nil
+	}
+	for _, name := range cert.DNSNames {
+		if name == want {
+			return nil
+		}
+	}
+	return fmt.Errorf("client certificate is not %q", want)
 }

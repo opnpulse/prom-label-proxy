@@ -435,38 +435,81 @@ func NewRoutes(upstream *url.URL, label string, extractLabeler ExtractLabeler, o
 	//	})),
 	//)
 
-	chHandler := func(backend http.Handler) http.Handler {
+	// chHandler serves a read for one pillar. Victoria keeps the path after the
+	// routing segment; ClickHouse is addressed at the root with a query param.
+	chHandler := func(routeSegment string, backend http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-			req.URL.Path = "/"
-			if user, pass := os.Getenv("CLICKHOUSE_USER"), os.Getenv("CLICKHOUSE_PASSWORD"); user != "" && pass != "" {
-				req.Header.Set("X-Clickhouse-User", user)
-				req.Header.Set("X-Clickhouse-Key", pass)
+			if _, ok := pathRewriteFrom(req.Context()); ok {
+				rest := strings.TrimPrefix(req.URL.Path, routeSegment)
+				if !applyReadRewrite(w, req, rest) {
+					return
+				}
+				if u, ok := upstreamOverride(req); ok {
+					httputil.NewSingleHostReverseProxy(u).ServeHTTP(w, req)
+					return
+				}
+				backend.ServeHTTP(w, req)
+				return
 			}
+
+			req.URL.Path = "/"
+			SetClickHouseCredentials(req.Header)
 			backend.ServeHTTP(w, req)
 		})
 	}
 
 	errs.Add(
-		mux.Handle("/logs", chHandler(r.logsHandler)),
-		mux.Handle("/traces", chHandler(r.tracesHandler)),
+		mux.Handle("/logs", chHandler("/logs", r.logsHandler)),
+		mux.Handle("/traces", chHandler("/traces", r.tracesHandler)),
 
 		mux.Handle("/metrics", http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-			path := strings.TrimPrefix(req.URL.Path, "/metrics")
-			req.URL.Path = path
+			req.URL.Path = strings.TrimPrefix(req.URL.Path, "/metrics")
+			if rw, ok := pathRewriteFrom(req.Context()); ok && !allowedReadPath(rw, req.URL.Path) {
+				http.Error(w, "only query endpoints are reachable here", http.StatusForbidden)
+				return
+			}
+			// Applied after the prefix is stripped so a select prefix lands on the
+			// bare API path rather than in front of the routing segment.
+			applyPathRewrite(req)
+			// A tenant whose metrics live in a specific instance is queried there,
+			// not at the single configured upstream.
+			if u, ok := upstreamOverride(req); ok {
+				httputil.NewSingleHostReverseProxy(u).ServeHTTP(w, req)
+				return
+			}
 			proxy.ServeHTTP(w, req)
 		})),
 
 		mux.Handle("/api/v1/receive", http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			applyPathRewrite(req)
+			// A tenant whose data lives in a specific instance overrides the
+			// pillar's single endpoint.
+			if u, ok := upstreamOverride(req); ok {
+				httputil.NewSingleHostReverseProxy(u).ServeHTTP(w, req)
+				return
+			}
 			r.thanosReceiverHandler.ServeHTTP(w, req)
 		})),
 
 		mux.Handle("/api/v1/logs", http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			// ClickHouse is addressed at the root with the database in the query
+			// string; a rewrite replaces that with the backend's own path.
 			req.URL.Path = "/"
+			applyPathRewrite(req)
+			if u, ok := upstreamOverride(req); ok {
+				httputil.NewSingleHostReverseProxy(u).ServeHTTP(w, req)
+				return
+			}
 			r.logsHandler.ServeHTTP(w, req)
 		})),
 
 		mux.Handle("/api/v1/traces", http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 			req.URL.Path = "/"
+			applyPathRewrite(req)
+			if u, ok := upstreamOverride(req); ok {
+				httputil.NewSingleHostReverseProxy(u).ServeHTTP(w, req)
+				return
+			}
 			r.tracesHandler.ServeHTTP(w, req)
 		})),
 	)
@@ -856,4 +899,29 @@ func mustProxyBackend(envVar string) *httputil.ReverseProxy {
 		log.Fatalf("invalid scheme for %s URL %q, only 'http' and 'https' are supported", envVar, raw)
 	}
 	return httputil.NewSingleHostReverseProxy(u)
+}
+
+// SetClickHouseCredentials replaces whatever the caller authenticated with by
+// the proxy's own ClickHouse user. ClickHouse refuses two methods at once, and
+// clickhouse-go always sends one: Basic auth, or with a TLS client certificate
+// X-ClickHouse-SSL-Certificate-Auth plus its own user.
+func SetClickHouseCredentials(h http.Header) {
+	user, pass := os.Getenv("CLICKHOUSE_USER"), os.Getenv("CLICKHOUSE_PASSWORD")
+	if user == "" || pass == "" {
+		return
+	}
+	for _, k := range []string{"Authorization", "X-Clickhouse-Ssl-Certificate-Auth", "X-Clickhouse-User", "X-Clickhouse-Key"} {
+		h.Del(k)
+	}
+	h.Set("X-Clickhouse-User", user)
+	h.Set("X-Clickhouse-Key", pass)
+}
+
+// ClickHouseWritePath maps a write on /api/v1/logs or /api/v1/traces onto the
+// router's ClickHouse route.
+func ClickHouseWritePath(path string) string {
+	if strings.HasPrefix(path, "/api/v1/traces") {
+		return "/traces"
+	}
+	return "/logs"
 }
