@@ -14,6 +14,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -412,6 +413,20 @@ func main() {
 				route, ok := routeForTenant(w, tenant)
 				if !ok || !requireInstance(w, tenant, "metrics", route.Metrics.WriteURL) {
 					return
+				}
+				// Only a cert that may speak for other tenants fills their accounts.
+				if claims.EnableTenant && !strings.Contains(r.Header.Get("Content-Type"), "write.v2") {
+					body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxCopyBody))
+					if err != nil {
+						http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
+						return
+					}
+					r.Body = io.NopCloser(bytes.NewReader(body))
+					r.ContentLength = int64(len(body))
+					if err := copyToClientOrgs(r.Context(), body, tenant, tenantCache, tenantCache.Backends().VictoriaMetricsStandalone()); err != nil {
+						http.Error(w, err.Error(), http.StatusBadGateway)
+						return
+					}
 				}
 				if tenantCache.Backends().VictoriaMetricsStandalone() {
 					r = r.WithContext(injectproxy.WithVictoriaMetricsSingleWrite(r.Context(), route.AccountID, route.ProjectID, route.Metrics.WriteURL))
